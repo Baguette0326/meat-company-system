@@ -1,0 +1,27 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local build and packaging artifacts
+.build-tools/
+build/
+tmp/
+Company Package/
+*.lnk
+
+# Customer orders and generated reports
+Orders/*
+!Orders/.gitkeep
+Daily Reports/*
+!Daily Reports/.gitkeep
+!Daily Reports/order-file-template-updated.xlsx
+Monthly Reports/*
+!Monthly Reports/.gitkeep
+outputs/
+duplicate_test/
+
+# Local preview artifacts
+*_preview.png
+*_font_fixed.png
+monthly_stats_page_*.png

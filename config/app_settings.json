@@ -1,0 +1,5 @@
+{
+  "orders_base_folder": "Orders",
+  "export_folder": "Daily Reports",
+  "monthly_export_folder": "Monthly Reports"
+}
