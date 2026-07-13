@@ -18,6 +18,7 @@ Daily Reports/*
 !Daily Reports/order-file-template-updated.xlsx
 Monthly Reports/*
 !Monthly Reports/.gitkeep
+Backups/
 outputs/
 duplicate_test/
 

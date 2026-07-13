@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
+from master_data import MASTER_DATA_PATH, ensure_master_data, refresh_all_order_templates
 from read_daily_orders import generate_daily_report, generate_monthly_report
 
 
@@ -109,6 +110,7 @@ class DailyReportApp(tk.Tk):
 
         self._configure_style()
         self._build_ui()
+        ensure_master_data()
         self._load_defaults()
 
     def _configure_style(self) -> None:
@@ -161,6 +163,17 @@ class DailyReportApp(tk.Tk):
         self.monthly_button.pack(anchor=tk.W, pady=4)
         ttk.Button(monthly_box, text="2. 打開本月月報", command=self.open_monthly_report).pack(anchor=tk.W, pady=4)
         ttk.Button(monthly_box, text="3. 打開本月 PDF", command=self.open_monthly_pdf).pack(anchor=tk.W, pady=4)
+
+        master_box = ttk.LabelFrame(root, text="貨品及客戶清單", padding=14)
+        master_box.pack(fill=tk.X, pady=(10, 8))
+        ttk.Label(
+            master_box,
+            text="新增貨品或客戶時，先打開清單修改，儲存並關閉 Excel，然後更新訂單模板。",
+            foreground="#475569",
+            font=("Microsoft JhengHei UI", 10),
+        ).pack(anchor=tk.W, pady=(0, 8))
+        ttk.Button(master_box, text="1. 打開貨品及客戶清單", command=self.open_master_data).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(master_box, text="2. 更新訂單", command=self.refresh_template).pack(side=tk.LEFT)
 
         status_box = ttk.LabelFrame(root, text="狀態", padding=12)
         status_box.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
@@ -388,6 +401,23 @@ class DailyReportApp(tk.Tk):
             messagebox.showerror(APP_TITLE, "找不到本月 PDF。請先產生本月月報。")
             return
         os.startfile(report)
+
+    def open_master_data(self) -> None:
+        ensure_master_data()
+        os.startfile(MASTER_DATA_PATH)
+
+    def refresh_template(self) -> None:
+        try:
+            refreshed_paths = refresh_all_order_templates(MASTER_DATA_PATH)
+        except PermissionError:
+            messagebox.showerror(APP_TITLE, "無法更新訂單模板。請先關閉已開啟的訂單模板 Excel。")
+            return
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror(APP_TITLE, f"更新訂單模板失敗：\n{exc}")
+            return
+        paths = "\n".join(str(path) for path in refreshed_paths)
+        self.status_var.set(f"訂單模板已更新下拉選單：\n{paths}")
+        messagebox.showinfo(APP_TITLE, "訂單模板已更新。")
 
     def open_order_folder(self) -> None:
         folder = Path(self.folder_var.get().strip())

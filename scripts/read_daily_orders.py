@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import re
 import unicodedata
 from collections import defaultdict
@@ -15,6 +16,8 @@ from openpyxl.chart import BarChart, LineChart, PieChart, Reference
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 from openpyxl.utils import get_column_letter
+
+from master_data import MASTER_DATA_PATH, MasterProduct, ensure_master_data, load_master_customers, load_master_products
 
 
 PRICE_TYPES = {
@@ -41,6 +44,7 @@ class SaleRow:
     order_date: date | None
     customer: str
     order_number: str
+    order_status: str
     category: str
     product: str
     part: str
@@ -58,6 +62,18 @@ class ImportIssue:
     row_number: int | None
     severity: str
     message: str
+
+
+COUNTED_ORDER_STATUSES = {"正常", "更正", "退貨"}
+ORDER_STATUS_ALIASES = {
+    "": "正常",
+    "正常": "正常",
+    "取消": "取消",
+    "已取消": "取消",
+    "更正": "更正",
+    "退貨": "退貨",
+    "退货": "退貨",
+}
 
 
 def to_decimal(value) -> Decimal | None:
@@ -116,6 +132,10 @@ def cell_text(value) -> str:
     return str(value).strip()
 
 
+def normalize_order_status(value) -> str:
+    return ORDER_STATUS_ALIASES.get(cell_text(value), cell_text(value))
+
+
 def get_sheet(workbook):
     if "訂單輸入" in workbook.sheetnames:
         return workbook["訂單輸入"]
@@ -126,24 +146,27 @@ def get_sheet(workbook):
 
 def read_header_fields(sheet):
     customer = cell_text(sheet["B5"].value)
+    order_status = normalize_order_status(sheet["C5"].value)
     order_date = normalize_date(sheet["F5"].value)
     order_number = cell_text(sheet["H5"].value)
 
     # Some users may enter the values beside the labels on row 5, but keep a
     # fallback search in case the layout is slightly shifted.
-    if not customer or not order_date or not order_number:
+    if not customer or not order_status or not order_date or not order_number:
         for row in sheet.iter_rows(min_row=1, max_row=8, min_col=1, max_col=8):
             values = [cell_text(cell.value) for cell in row]
             for index, value in enumerate(values):
                 next_value = values[index + 1] if index + 1 < len(values) else ""
                 if not customer and value.startswith("客戶名稱"):
                     customer = next_value
+                if not order_status and value.startswith("訂單狀態"):
+                    order_status = normalize_order_status(next_value)
                 if not order_date and value.startswith("日期"):
                     order_date = normalize_date(next_value)
                 if not order_number and value.startswith("發貨單編號"):
                     order_number = next_value
 
-    return customer, order_date, order_number
+    return customer, order_status or "正常", order_date, order_number
 
 
 def is_section_or_header(row_values: list[str]) -> bool:
@@ -174,7 +197,12 @@ def folder_date(folder: Path) -> date | None:
         return None
 
 
-def read_order_file(path: Path, expected_folder_date: date | None = None) -> tuple[list[SaleRow], list[ImportIssue]]:
+def read_order_file(
+    path: Path,
+    expected_folder_date: date | None = None,
+    master_products: dict[str, MasterProduct] | None = None,
+    master_customers: set[str] | None = None,
+) -> tuple[list[SaleRow], list[ImportIssue]]:
     issues: list[ImportIssue] = []
     rows: list[SaleRow] = []
     meta = parse_filename(path)
@@ -195,10 +223,21 @@ def read_order_file(path: Path, expected_folder_date: date | None = None) -> tup
         return [], [ImportIssue(path.name, None, "錯誤", f"無法開啟 Excel 檔案: {exc}")]
 
     sheet = get_sheet(workbook)
-    customer, order_date, order_number = read_header_fields(sheet)
+    customer, order_status, order_date, order_number = read_header_fields(sheet)
 
     if not customer:
         issues.append(ImportIssue(path.name, None, "錯誤", "B5 缺少客戶名稱"))
+    elif master_customers is not None and master_customers and customer not in master_customers:
+        issues.append(ImportIssue(path.name, None, "警告", f"客戶「{customer}」不在客戶清單內"))
+    if order_status not in ORDER_STATUS_ALIASES.values():
+        issues.append(
+            ImportIssue(
+                path.name,
+                None,
+                "錯誤",
+                f"C5 訂單狀態「{order_status}」無效，請使用：正常、取消、更正、退貨",
+            )
+        )
     if not order_date:
         issues.append(ImportIssue(path.name, None, "錯誤", "F5 缺少日期或日期格式無效"))
     if not order_number:
@@ -242,6 +281,12 @@ def read_order_file(path: Path, expected_folder_date: date | None = None) -> tup
             )
         )
 
+    if order_status == "取消":
+        issues.append(ImportIssue(path.name, None, "提示", "訂單狀態為取消，已保留記錄但不計入銷售數量及收入"))
+        return [], issues
+    if order_status not in COUNTED_ORDER_STATUSES:
+        return [], issues
+
     # Product entry rows start after the top order header. Rows above 7 contain
     # customer/date/order fields, which must not be interpreted as item prices.
     for row_number in range(7, sheet.max_row + 1):
@@ -268,6 +313,22 @@ def read_order_file(path: Path, expected_folder_date: date | None = None) -> tup
             continue
         if not product:
             continue
+        if master_products is not None and master_products:
+            master_product = master_products.get(product)
+            if master_product is None:
+                issues.append(ImportIssue(path.name, row_number, "警告", f"{product}: 不在貨品清單內"))
+            else:
+                if not master_product.active:
+                    issues.append(ImportIssue(path.name, row_number, "警告", f"{product}: 貨品清單狀態為停用"))
+                if master_product.category and category and master_product.category != category:
+                    issues.append(
+                        ImportIssue(
+                            path.name,
+                            row_number,
+                            "警告",
+                            f"{product}: Excel 分類「{category}」與貨品清單「{master_product.category}」不一致",
+                        )
+                    )
         if quantity is None and not average_price and not cheap_price and not fine_price:
             continue
 
@@ -298,6 +359,9 @@ def read_order_file(path: Path, expected_folder_date: date | None = None) -> tup
             issues.append(ImportIssue(path.name, row_number, "錯誤", f"{product}: 售價必須大於 0"))
             continue
 
+        if order_status == "退貨":
+            quantity = -quantity
+
         revenue = money(quantity * unit_price)
         estimated_margin = money(quantity * (unit_price - buy_in_price)) if buy_in_price is not None else None
 
@@ -308,6 +372,7 @@ def read_order_file(path: Path, expected_folder_date: date | None = None) -> tup
                 order_date=order_date,
                 customer=customer,
                 order_number=order_number,
+                order_status=order_status,
                 category=category,
                 product=product,
                 part=part,
@@ -381,6 +446,31 @@ def detect_duplicate_orders(sale_rows: list[SaleRow]) -> list[ImportIssue]:
             seen_content[content_signature] = source_file
 
     return issues
+
+
+def detect_order_adjustments(sale_rows: list[SaleRow]) -> list[ImportIssue]:
+    issues: list[ImportIssue] = []
+    rows_by_file: dict[str, list[SaleRow]] = defaultdict(list)
+    for row in sale_rows:
+        rows_by_file[row.source_file].append(row)
+
+    for source_file, rows in sorted(rows_by_file.items()):
+        if not rows:
+            continue
+        status = rows[0].order_status
+        if status == "更正":
+            issues.append(ImportIssue(source_file, None, "提示", "訂單狀態為更正，請留意此單為修改後記錄"))
+        elif status == "退貨":
+            issues.append(ImportIssue(source_file, None, "提示", "訂單狀態為退貨，數量及收入已用負數計算"))
+    return issues
+
+
+def adjustment_counts(sale_rows: list[SaleRow], issues: list[ImportIssue]) -> dict[str, int]:
+    return {
+        "取消": len({issue.source_file for issue in issues if "訂單狀態為取消" in issue.message}),
+        "更正": len({row.source_file for row in sale_rows if row.order_status == "更正"}),
+        "退貨": len({row.source_file for row in sale_rows if row.order_status == "退貨"}),
+    }
 
 
 def safe_table_name(title: str) -> str:
@@ -549,6 +639,7 @@ def write_report(output_path: Path, sale_rows: list[SaleRow], issues: list[Impor
     total_quantity = sum((row.quantity for row in sale_rows), Decimal("0"))
     dates = sorted({row.order_date for row in sale_rows if row.order_date})
     report_date = dates[0].isoformat() if len(dates) == 1 else "Multiple / unknown"
+    adjustments = adjustment_counts(sale_rows, issues)
 
     summary = [
         ["報表日期", report_date],
@@ -556,6 +647,9 @@ def write_report(output_path: Path, sale_rows: list[SaleRow], issues: list[Impor
         ["售出貨品記錄數", len(sale_rows)],
         ["總售出数量", float(total_quantity)],
         ["總收入 HKD", float(total_revenue)],
+        ["取消訂單數量", adjustments["取消"]],
+        ["更正訂單數量", adjustments["更正"]],
+        ["退貨訂單數量", adjustments["退貨"]],
         ["問題數量", len(issues)],
     ]
     add_sheet(workbook, "總覽", ["項目", "數值"], summary)
@@ -606,6 +700,7 @@ def write_report(output_path: Path, sale_rows: list[SaleRow], issues: list[Impor
             "日期",
             "客戶",
             "發貨單編號",
+            "訂單狀態",
             "分類",
             "貨品",
             "部位",
@@ -621,6 +716,7 @@ def write_report(output_path: Path, sale_rows: list[SaleRow], issues: list[Impor
                 row.order_date.isoformat() if row.order_date else "",
                 row.customer,
                 row.order_number,
+                row.order_status,
                 row.category,
                 row.product,
                 row.part,
@@ -668,6 +764,7 @@ def write_monthly_report(
     customers = len({row.customer for row in sale_rows if row.customer})
     avg_order = money(total_revenue / Decimal(order_files)) if order_files else Decimal("0")
     avg_price = money(total_revenue / total_quantity) if total_quantity else Decimal("0")
+    adjustments = adjustment_counts(sale_rows, issues)
 
     summary = [
         ["報表月份", month],
@@ -678,6 +775,9 @@ def write_monthly_report(
         ["總收入 HKD", float(total_revenue)],
         ["平均每單收入 HKD", float(avg_order or Decimal("0"))],
         ["平均售價 HKD", float(avg_price or Decimal("0"))],
+        ["取消訂單數量", adjustments["取消"]],
+        ["更正訂單數量", adjustments["更正"]],
+        ["退貨訂單數量", adjustments["退貨"]],
         ["問題數量", len(issues)],
     ]
     summary_sheet = add_sheet(workbook, "總覽", ["項目", "數值"], summary)
@@ -892,6 +992,7 @@ def write_monthly_report(
             "日期",
             "客戶",
             "發貨單編號",
+            "訂單狀態",
             "分類",
             "貨品",
             "部位",
@@ -907,6 +1008,7 @@ def write_monthly_report(
                 row.order_date.isoformat() if row.order_date else "",
                 row.customer,
                 row.order_number,
+                row.order_status,
                 row.category,
                 row.product,
                 row.part,
@@ -953,6 +1055,29 @@ def reorder_monthly_sheets(workbook: Workbook) -> None:
     workbook._sheets = [workbook[name] for name in preferred_order if name in workbook.sheetnames]
 
 
+def load_master_context() -> tuple[dict[str, MasterProduct], set[str]]:
+    ensure_master_data()
+    return load_master_products(MASTER_DATA_PATH), load_master_customers(MASTER_DATA_PATH)
+
+
+def timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def copy_files_to_backup(files: list[Path], backup_root: Path) -> None:
+    backup_root.mkdir(parents=True, exist_ok=True)
+    for source in files:
+        if not source.exists() or not source.is_file():
+            continue
+        target = backup_root / source.name
+        shutil.copy2(source, target)
+
+
+def backup_generated_report(output_path: Path, backup_root: Path) -> None:
+    files = [output_path, output_path.with_suffix(".pdf")]
+    copy_files_to_backup([path for path in files if path.exists()], backup_root)
+
+
 def generate_daily_report(folder: Path, output_path: Path) -> tuple[int, int, int]:
     """Read a folder of order workbooks, write report, return counts.
 
@@ -963,17 +1088,23 @@ def generate_daily_report(folder: Path, output_path: Path) -> tuple[int, int, in
     all_issues: list[ImportIssue] = []
     workbook_paths = list(iter_workbooks(folder))
     expected_folder_date = folder_date(folder)
+    master_products, master_customers = load_master_context()
+    backup_root = output_path.parents[1] / "Backups" if len(output_path.parents) > 1 else output_path.parent / "Backups"
+    run_backup = backup_root / f"daily_{folder.name}_{timestamp()}"
+    copy_files_to_backup(workbook_paths, run_backup / "input_orders")
 
     for workbook_path in workbook_paths:
-        rows, issues = read_order_file(workbook_path, expected_folder_date)
+        rows, issues = read_order_file(workbook_path, expected_folder_date, master_products, master_customers)
         all_rows.extend(rows)
         all_issues.extend(issues)
 
     all_issues.extend(detect_duplicate_orders(all_rows))
+    all_issues.extend(detect_order_adjustments(all_rows))
     write_report(output_path, all_rows, all_issues)
     from report_pdfs import write_daily_pdf
 
     write_daily_pdf(output_path.with_suffix(".pdf"), all_rows, all_issues)
+    backup_generated_report(output_path, run_backup / "reports")
     return len(workbook_paths), len(all_rows), len(all_issues)
 
 
@@ -994,6 +1125,9 @@ def generate_monthly_report(orders_base_folder: Path, month: str, output_path: P
     file_count = 0
     current_month_date = datetime.strptime(month + "01", "%Y%m%d").date()
     previous_month = (current_month_date.replace(day=1) - timedelta(days=1)).strftime("%Y%m")
+    master_products, master_customers = load_master_context()
+    backup_root = output_path.parents[1] / "Backups" if len(output_path.parents) > 1 else output_path.parent / "Backups"
+    run_backup = backup_root / f"monthly_{month}_{timestamp()}"
 
     for day_folder in sorted(orders_base_folder.iterdir()):
         if not day_folder.is_dir():
@@ -1008,8 +1142,9 @@ def generate_monthly_report(orders_base_folder: Path, month: str, output_path: P
         workbook_paths = list(iter_workbooks(day_folder))
         if folder_month == month:
             file_count += len(workbook_paths)
+            copy_files_to_backup(workbook_paths, run_backup / "input_orders" / day_folder.name)
         for workbook_path in workbook_paths:
-            rows, issues = read_order_file(workbook_path, expected_folder_date)
+            rows, issues = read_order_file(workbook_path, expected_folder_date, master_products, master_customers)
             if folder_month == month:
                 all_rows.extend(rows)
                 all_issues.extend(issues)
@@ -1017,10 +1152,12 @@ def generate_monthly_report(orders_base_folder: Path, month: str, output_path: P
                 previous_rows.extend(rows)
 
     all_issues.extend(detect_duplicate_orders(all_rows))
+    all_issues.extend(detect_order_adjustments(all_rows))
     write_monthly_report(output_path, month, all_rows, all_issues, previous_rows)
     from report_pdfs import write_monthly_pdf
 
     write_monthly_pdf(output_path.with_suffix(".pdf"), month, all_rows, previous_rows, all_issues)
+    backup_generated_report(output_path, run_backup / "reports")
     return file_count, len(all_rows), len(all_issues)
 
 
