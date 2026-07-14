@@ -110,6 +110,93 @@ def grouped(rows, key_fn):
     return result
 
 
+def pdf_pct_change(current: Decimal, previous: Decimal) -> Decimal | None:
+    if previous == 0:
+        return None
+    return (current - previous) / previous * Decimal("100")
+
+
+def pdf_pct(value: Decimal | None) -> str:
+    if value is None:
+        return "沒有上月資料"
+    return f"{float(value):+.1f}%"
+
+
+def add_pdf_alert(alerts: list[list[str]], severity: str, title: str, detail: str, action: str) -> None:
+    alerts.append([severity, title, detail, action])
+
+
+def adjustment_counts(rows, issues) -> dict[str, int]:
+    return {
+        "取消": len({issue.source_file for issue in issues if "訂單狀態為取消" in issue.message}),
+        "更正": len({row.source_file for row in rows if row.order_status == "更正"}),
+        "退貨": len({row.source_file for row in rows if row.order_status == "退貨"}),
+    }
+
+
+def monthly_alerts(rows, previous_rows, issues) -> list[list[str]]:
+    alerts: list[list[str]] = []
+    total_revenue = sum((row.revenue for row in rows), Decimal("0"))
+    previous_revenue = sum((row.revenue for row in previous_rows), Decimal("0"))
+    total_quantity = sum((row.quantity for row in rows), Decimal("0"))
+    previous_quantity = sum((row.quantity for row in previous_rows), Decimal("0"))
+    current_customers = grouped(rows, lambda row: row.customer)
+    previous_customers = grouped(previous_rows, lambda row: row.customer)
+    current_products = grouped(rows, lambda row: (row.category, row.product))
+    previous_products = grouped(previous_rows, lambda row: (row.category, row.product))
+    adjustments = adjustment_counts(rows, issues)
+
+    if not rows:
+        add_pdf_alert(alerts, "高", "本月沒有有效銷售資料", "沒有讀到可計算的售出貨品。", "檢查訂單資料夾。")
+    if issues:
+        add_pdf_alert(alerts, "中", "有輸入問題需要檢查", f"共有 {len(issues)} 個提示/警告/錯誤。", "查看 Excel「問題」分頁。")
+    if any(adjustments.values()):
+        add_pdf_alert(alerts, "中", "本月有訂單調整", f"取消 {adjustments['取消']}，更正 {adjustments['更正']}，退貨 {adjustments['退貨']}。", "確認調整原因。")
+
+    revenue_change = pdf_pct_change(total_revenue, previous_revenue)
+    if revenue_change is not None:
+        if revenue_change <= Decimal("-20"):
+            add_pdf_alert(alerts, "高", "收入明顯下降", f"較上月 {pdf_pct(revenue_change)}。", "檢查主要客戶及貨品。")
+        elif revenue_change >= Decimal("20"):
+            add_pdf_alert(alerts, "低", "收入明顯上升", f"較上月 {pdf_pct(revenue_change)}。", "確認增長來源。")
+
+    quantity_change = pdf_pct_change(total_quantity, previous_quantity)
+    if quantity_change is not None:
+        if quantity_change <= Decimal("-20"):
+            add_pdf_alert(alerts, "高", "銷量明顯下降", f"較上月 {pdf_pct(quantity_change)}。", "檢查需求或缺貨。")
+        elif quantity_change >= Decimal("20"):
+            add_pdf_alert(alerts, "低", "銷量明顯上升", f"較上月 {pdf_pct(quantity_change)}。", "留意庫存供應。")
+
+    lost_customers = [
+        customer
+        for customer, previous in previous_customers.items()
+        if previous["revenue"] > 0 and current_customers[customer]["revenue"] == 0
+    ]
+    if lost_customers:
+        add_pdf_alert(alerts, "高", "有客戶本月沒有再下單", f"{len(lost_customers)} 位上月客戶本月沒有收入。", "跟進客戶狀況。")
+
+    changed_products = []
+    for product, previous in previous_products.items():
+        if previous["quantity"] == 0:
+            continue
+        ratio = pdf_pct_change(current_products[product]["quantity"], previous["quantity"])
+        if ratio is not None and abs(ratio) >= Decimal("30"):
+            changed_products.append((product, ratio))
+    if changed_products:
+        product, ratio = sorted(changed_products, key=lambda item: abs(item[1]), reverse=True)[0]
+        add_pdf_alert(alerts, "中", "貨品需求變化明顯", f"{product[1]} 售出数量較上月 {pdf_pct(ratio)}。", "查看貨品分析。")
+
+    if total_revenue > 0 and current_customers:
+        top_customer, top_value = max(current_customers.items(), key=lambda item: item[1]["revenue"])
+        share = top_value["revenue"] / total_revenue * Decimal("100")
+        if share >= Decimal("50"):
+            add_pdf_alert(alerts, "中", "收入集中在單一客戶", f"{top_customer} 佔本月收入 {float(share):.1f}%。", "留意客戶集中風險。")
+
+    if not alerts:
+        add_pdf_alert(alerts, "正常", "沒有明顯異常", "本月沒有觸發管理提示。", "可正常查看月報。")
+    return alerts[:8]
+
+
 def write_daily_pdf(output: Path, rows, issues) -> None:
     setup_fonts()
     pdf = canvas.Canvas(str(output), pagesize=PAGE)
@@ -254,5 +341,22 @@ def write_monthly_pdf(output: Path, month: str, rows, previous_rows, issues) -> 
     pdf.setFillColor(GRAY)
     pdf.setFont(FONT_NAME, 9)
     pdf.drawString(14 * mm, 10 * mm, f"問題數量：{len(issues)}。完整客戶、貨品、分類、每日走勢及問題資料請查看 Excel 月報。")
+    pdf.showPage()
+
+    draw_title(pdf, "管理提示", month)
+    alert_table = make_table(
+        "老闆重點提示",
+        ["程度", "提示", "內容", "建議"],
+        monthly_alerts(rows, previous_rows, issues),
+        [20 * mm, 46 * mm, 96 * mm, 96 * mm],
+    )
+    current_y = PAGE[1] - 42 * mm
+    for flowable in alert_table:
+        _, height = flowable.wrap(PAGE[0] - 28 * mm, PAGE[1])
+        flowable.drawOn(pdf, 14 * mm, current_y - height)
+        current_y -= height + 3 * mm
+    pdf.setFillColor(GRAY)
+    pdf.setFont(FONT_NAME, 9)
+    pdf.drawString(14 * mm, 10 * mm, "提示只作管理參考，詳細資料以 Excel 月報各分頁為準。")
     pdf.showPage()
     pdf.save()

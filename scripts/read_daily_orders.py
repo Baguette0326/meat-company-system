@@ -473,6 +473,170 @@ def adjustment_counts(sale_rows: list[SaleRow], issues: list[ImportIssue]) -> di
     }
 
 
+def grouped_values(rows: list[SaleRow], key_fn):
+    result = defaultdict(lambda: {"quantity": Decimal("0"), "revenue": Decimal("0"), "files": set(), "rows": 0})
+    for row in rows:
+        key = key_fn(row)
+        result[key]["quantity"] += row.quantity
+        result[key]["revenue"] += row.revenue
+        result[key]["files"].add(row.source_file)
+        result[key]["rows"] += 1
+    return result
+
+
+def change_ratio(current: Decimal, previous: Decimal) -> Decimal | None:
+    if previous == 0:
+        return None
+    return (current - previous) / previous * Decimal("100")
+
+
+def format_percent(value: Decimal | None) -> str:
+    if value is None:
+        return "沒有上月資料"
+    rounded = money(value) or Decimal("0")
+    return f"{rounded:+.2f}%"
+
+
+def append_alert(alerts: list[list[str]], severity: str, title: str, detail: str, action: str) -> None:
+    alerts.append([severity, title, detail, action])
+
+
+def build_daily_alerts(sale_rows: list[SaleRow], issues: list[ImportIssue]) -> list[list[str]]:
+    alerts: list[list[str]] = []
+    total_revenue = sum((row.revenue for row in sale_rows), Decimal("0"))
+    adjustments = adjustment_counts(sale_rows, issues)
+
+    if not sale_rows:
+        append_alert(alerts, "高", "沒有有效銷售資料", "今日沒有讀到可計算的售出貨品。", "檢查訂單資料夾及 Excel 輸入。")
+    if issues:
+        append_alert(alerts, "中", "有輸入問題需要檢查", f"今日共有 {len(issues)} 個提示/警告/錯誤。", "查看「問題」分頁。")
+    if any(adjustments.values()):
+        append_alert(
+            alerts,
+            "中",
+            "今日有訂單調整",
+            f"取消 {adjustments['取消']} 張，更正 {adjustments['更正']} 張，退貨 {adjustments['退貨']} 張。",
+            "確認調整原因及是否已通知相關人員。",
+        )
+
+    customers = grouped_values(sale_rows, lambda row: row.customer)
+    if total_revenue > 0 and customers:
+        top_customer, top_value = max(customers.items(), key=lambda item: item[1]["revenue"])
+        share = top_value["revenue"] / total_revenue * Decimal("100")
+        if share >= Decimal("60"):
+            append_alert(
+                alerts,
+                "低",
+                "收入集中在單一客戶",
+                f"{top_customer} 佔今日收入 {format_percent(share)}。",
+                "留意是否過度依賴單一客戶。",
+            )
+
+    products = grouped_values(sale_rows, lambda row: (row.category, row.product))
+    if total_revenue > 0 and products:
+        top_product, top_value = max(products.items(), key=lambda item: item[1]["revenue"])
+        share = top_value["revenue"] / total_revenue * Decimal("100")
+        if share >= Decimal("50"):
+            append_alert(
+                alerts,
+                "低",
+                "收入集中在單一貨品",
+                f"{top_product[1]} 佔今日收入 {format_percent(share)}。",
+                "留意此貨品供應及價格變化。",
+            )
+
+    if not alerts:
+        append_alert(alerts, "正常", "沒有明顯異常", "今日銷售資料沒有觸發管理提示。", "可正常查看報表。")
+    return alerts
+
+
+def build_monthly_alerts(sale_rows: list[SaleRow], previous_rows: list[SaleRow], issues: list[ImportIssue]) -> list[list[str]]:
+    alerts: list[list[str]] = []
+    total_revenue = sum((row.revenue for row in sale_rows), Decimal("0"))
+    previous_revenue = sum((row.revenue for row in previous_rows), Decimal("0"))
+    total_quantity = sum((row.quantity for row in sale_rows), Decimal("0"))
+    previous_quantity = sum((row.quantity for row in previous_rows), Decimal("0"))
+    order_count = len({row.source_file for row in sale_rows})
+    previous_order_count = len({row.source_file for row in previous_rows})
+    adjustments = adjustment_counts(sale_rows, issues)
+
+    if not sale_rows:
+        append_alert(alerts, "高", "本月沒有有效銷售資料", "系統沒有讀到本月可計算的售出貨品。", "檢查本月每日訂單資料夾。")
+    if issues:
+        append_alert(alerts, "中", "本月有輸入問題需要檢查", f"共有 {len(issues)} 個提示/警告/錯誤。", "查看「問題」分頁並修正來源訂單。")
+    if any(adjustments.values()):
+        append_alert(
+            alerts,
+            "中",
+            "本月有訂單調整",
+            f"取消 {adjustments['取消']} 張，更正 {adjustments['更正']} 張，退貨 {adjustments['退貨']} 張。",
+            "確認調整是否合理，並保留原始訂單記錄。",
+        )
+
+    revenue_change = change_ratio(total_revenue, previous_revenue)
+    if revenue_change is not None:
+        if revenue_change <= Decimal("-20"):
+            append_alert(alerts, "高", "收入明顯下降", f"本月收入較上月 {format_percent(revenue_change)}。", "檢查主要客戶及主要貨品是否下跌。")
+        elif revenue_change >= Decimal("20"):
+            append_alert(alerts, "低", "收入明顯上升", f"本月收入較上月 {format_percent(revenue_change)}。", "確認增長來自哪些客戶/貨品。")
+
+    quantity_change = change_ratio(total_quantity, previous_quantity)
+    if quantity_change is not None:
+        if quantity_change <= Decimal("-20"):
+            append_alert(alerts, "高", "銷量明顯下降", f"本月售出数量較上月 {format_percent(quantity_change)}。", "檢查需求下跌或缺貨情況。")
+        elif quantity_change >= Decimal("20"):
+            append_alert(alerts, "低", "銷量明顯上升", f"本月售出数量較上月 {format_percent(quantity_change)}。", "留意庫存及供應是否足夠。")
+
+    order_change = change_ratio(Decimal(order_count), Decimal(previous_order_count))
+    if order_change is not None and order_change <= Decimal("-20"):
+        append_alert(alerts, "中", "訂單數量下降", f"本月訂單數量較上月 {format_percent(order_change)}。", "檢查是否有客戶少下單。")
+
+    current_customers = grouped_values(sale_rows, lambda row: row.customer)
+    previous_customers = grouped_values(previous_rows, lambda row: row.customer)
+    lost_customers = [
+        customer
+        for customer, previous in previous_customers.items()
+        if previous["revenue"] > 0 and current_customers[customer]["revenue"] == 0
+    ]
+    if lost_customers:
+        sample = "、".join(lost_customers[:5])
+        append_alert(alerts, "高", "有客戶本月沒有再下單", f"{len(lost_customers)} 位上月客戶本月沒有收入：{sample}", "跟進是否流失、休業或資料未輸入。")
+
+    dropped_customers = []
+    for customer, previous in previous_customers.items():
+        previous_value = previous["revenue"]
+        current_value = current_customers[customer]["revenue"]
+        ratio = change_ratio(current_value, previous_value)
+        if ratio is not None and previous_value > 0 and current_value > 0 and ratio <= Decimal("-30"):
+            dropped_customers.append((customer, ratio))
+    if dropped_customers:
+        customer, ratio = sorted(dropped_customers, key=lambda item: item[1])[0]
+        append_alert(alerts, "中", "主要客戶收入下跌", f"{customer} 較上月 {format_percent(ratio)}。", "查看客戶分析，確認下跌原因。")
+
+    current_products = grouped_values(sale_rows, lambda row: (row.category, row.product))
+    previous_products = grouped_values(previous_rows, lambda row: (row.category, row.product))
+    changed_products = []
+    for product, previous in previous_products.items():
+        previous_qty = previous["quantity"]
+        current_qty = current_products[product]["quantity"]
+        ratio = change_ratio(current_qty, previous_qty)
+        if ratio is not None and previous_qty > 0 and abs(ratio) >= Decimal("30"):
+            changed_products.append((product, ratio))
+    if changed_products:
+        product, ratio = sorted(changed_products, key=lambda item: abs(item[1]), reverse=True)[0]
+        append_alert(alerts, "中", "貨品需求變化明顯", f"{product[1]} 售出数量較上月 {format_percent(ratio)}。", "查看貨品分析，調整採購或供應安排。")
+
+    if total_revenue > 0 and current_customers:
+        customer_revenues = sorted(current_customers.items(), key=lambda item: item[1]["revenue"], reverse=True)
+        top_share = customer_revenues[0][1]["revenue"] / total_revenue * Decimal("100")
+        if top_share >= Decimal("50"):
+            append_alert(alerts, "中", "收入集中在單一客戶", f"{customer_revenues[0][0]} 佔本月收入 {format_percent(top_share)}。", "留意客戶集中風險。")
+
+    if not alerts:
+        append_alert(alerts, "正常", "沒有明顯異常", "本月銷售資料沒有觸發管理提示。", "可正常查看月報。")
+    return alerts
+
+
 def safe_table_name(title: str) -> str:
     # Excel table names are strict; use ASCII regardless of sheet title.
     suffix = abs(hash(title)) % 1_000_000
@@ -653,6 +817,7 @@ def write_report(output_path: Path, sale_rows: list[SaleRow], issues: list[Impor
         ["問題數量", len(issues)],
     ]
     add_sheet(workbook, "總覽", ["項目", "數值"], summary)
+    add_sheet(workbook, "管理提示", ["嚴重程度", "提示", "內容", "建議行動"], build_daily_alerts(sale_rows, issues))
 
     grouped = defaultdict(lambda: {"quantity": Decimal("0"), "revenue": Decimal("0"), "rows": 0})
     for row in sale_rows:
@@ -781,6 +946,7 @@ def write_monthly_report(
         ["問題數量", len(issues)],
     ]
     summary_sheet = add_sheet(workbook, "總覽", ["項目", "數值"], summary)
+    add_sheet(workbook, "管理提示", ["嚴重程度", "提示", "內容", "建議行動"], build_monthly_alerts(sale_rows, previous_rows, issues))
 
     grouped = defaultdict(lambda: {"quantity": Decimal("0"), "revenue": Decimal("0"), "rows": 0, "files": set()})
     for row in sale_rows:
@@ -936,14 +1102,6 @@ def write_monthly_report(
         ],
     )
 
-    def grouped_values(rows: list[SaleRow], key_fn):
-        result = defaultdict(lambda: {"quantity": Decimal("0"), "revenue": Decimal("0")})
-        for row in rows:
-            key = key_fn(row)
-            result[key]["quantity"] += row.quantity
-            result[key]["revenue"] += row.revenue
-        return result
-
     current_customer = grouped_values(sale_rows, lambda row: row.customer)
     previous_customer = grouped_values(previous_rows, lambda row: row.customer)
     customer_keys = sorted(set(current_customer) | set(previous_customer))
@@ -1038,6 +1196,7 @@ def write_monthly_report(
 def reorder_monthly_sheets(workbook: Workbook) -> None:
     preferred_order = [
         "總覽",
+        "管理提示",
         "月度比較",
         "客戶分析",
         "貨品分析",

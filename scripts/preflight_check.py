@@ -161,6 +161,9 @@ def run() -> None:
         daily_issue_text = "\n".join(str(row[2]) for row in daily_issues_sheet.iter_rows(min_row=2, values_only=True))
         require("訂單狀態為更正" in daily_issue_text, "Daily corrected-order issue notice missing")
         require("訂單狀態為退貨" in daily_issue_text, "Daily return-order issue notice missing")
+        daily_alerts_sheet = load_workbook(daily_xlsx, data_only=True)["管理提示"]
+        daily_alert_text = "\n".join(str(row[1]) for row in daily_alerts_sheet.iter_rows(min_row=2, values_only=True))
+        require("今日有訂單調整" in daily_alert_text, "Daily management adjustment alert missing")
         daily_backups = list((root / "Backups").glob("daily_20260618_*/reports/每日報表_20260618.xlsx"))
         require(daily_backups, "Daily report backup missing")
 
@@ -177,6 +180,10 @@ def run() -> None:
         monthly_issue_text = "\n".join(str(row[2]) for row in monthly_issues_sheet.iter_rows(min_row=2, values_only=True))
         require("訂單狀態為更正" in monthly_issue_text, "Monthly corrected-order issue notice missing")
         require("訂單狀態為退貨" in monthly_issue_text, "Monthly return-order issue notice missing")
+        monthly_alerts_sheet = load_workbook(monthly_xlsx, data_only=True)["管理提示"]
+        monthly_alert_text = "\n".join(str(row[1]) for row in monthly_alerts_sheet.iter_rows(min_row=2, values_only=True))
+        require("收入明顯上升" in monthly_alert_text, "Monthly revenue management alert missing")
+        require("本月有訂單調整" in monthly_alert_text, "Monthly adjustment management alert missing")
         monthly_backups = list((root / "Backups").glob("monthly_202606_*/reports/月報表_202606.xlsx"))
         require(monthly_backups, "Monthly report backup missing")
         comparison = load_workbook(monthly_xlsx, data_only=True)["月度比較"]
@@ -185,7 +192,7 @@ def run() -> None:
         )
         require(Decimal(str(revenue_comparison[1])) == Decimal("215"), "Current-month comparison revenue incorrect")
         require(Decimal(str(revenue_comparison[2])) == Decimal("10"), "Previous-month comparison revenue incorrect")
-        require(len(PdfReader(monthly_xlsx.with_suffix(".pdf")).pages) == 2, "Monthly PDF is not two pages")
+        require(len(PdfReader(monthly_xlsx.with_suffix(".pdf")).pages) == 3, "Monthly PDF is not three pages")
 
         dynamic_template = root / "Order Template" / "order-file-template.xlsx"
         dynamic_master = root / "Master Data" / "master-data.xlsx"
