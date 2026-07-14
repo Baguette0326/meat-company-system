@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import shutil
 import re
 import unicodedata
@@ -637,6 +638,101 @@ def build_monthly_alerts(sale_rows: list[SaleRow], previous_rows: list[SaleRow],
     return alerts
 
 
+def clamp_decimal(value: Decimal, minimum: Decimal, maximum: Decimal) -> Decimal:
+    return max(minimum, min(maximum, value))
+
+
+def forecast_confidence(elapsed_days: int, order_count: int, previous_rows: list[SaleRow]) -> str:
+    if elapsed_days >= 14 and order_count >= 20 and previous_rows:
+        return "高"
+    if elapsed_days >= 7 and order_count >= 5:
+        return "中"
+    return "低"
+
+
+def forecast_value(current_month_end: Decimal, previous_value: Decimal) -> Decimal:
+    if previous_value <= 0:
+        return current_month_end
+    trend = (current_month_end - previous_value) / previous_value
+    capped_trend = clamp_decimal(trend, Decimal("-0.30"), Decimal("0.30"))
+    # Use half the trend to avoid overreacting to one abnormal month.
+    return current_month_end * (Decimal("1") + capped_trend / Decimal("2"))
+
+
+def build_forecast_rows(month: str, sale_rows: list[SaleRow], previous_rows: list[SaleRow]) -> list[list]:
+    dates = [row.order_date for row in sale_rows if row.order_date]
+    year = int(month[:4])
+    month_number = int(month[4:])
+    days_in_month = calendar.monthrange(year, month_number)[1]
+    elapsed_days = max((day.day for day in dates), default=0)
+    elapsed_days = max(1, min(elapsed_days, days_in_month))
+    scale = Decimal(days_in_month) / Decimal(elapsed_days)
+    order_count = len({row.source_file for row in sale_rows})
+    previous_order_count = len({row.source_file for row in previous_rows})
+    confidence = forecast_confidence(elapsed_days, order_count, previous_rows)
+
+    total_revenue = sum((row.revenue for row in sale_rows), Decimal("0"))
+    total_quantity = sum((row.quantity for row in sale_rows), Decimal("0"))
+    previous_revenue = sum((row.revenue for row in previous_rows), Decimal("0"))
+    previous_quantity = sum((row.quantity for row in previous_rows), Decimal("0"))
+
+    forecast_rows = [
+        [
+            "總覽",
+            "總收入 HKD",
+            float(money(total_revenue) or Decimal("0")),
+            float(money(total_revenue * scale) or Decimal("0")),
+            float(money(forecast_value(total_revenue * scale, previous_revenue)) or Decimal("0")),
+            confidence,
+            f"根據本月首 {elapsed_days} 日資料估算；新系統初期只作參考。",
+        ],
+        [
+            "總覽",
+            "總售出数量",
+            float(money(total_quantity) or Decimal("0")),
+            float(money(total_quantity * scale) or Decimal("0")),
+            float(money(forecast_value(total_quantity * scale, previous_quantity)) or Decimal("0")),
+            confidence,
+            f"根據本月首 {elapsed_days} 日資料估算；會受假期及大客戶訂單影響。",
+        ],
+        [
+            "總覽",
+            "總訂單數量",
+            order_count,
+            float(money(Decimal(order_count) * scale) or Decimal("0")),
+            float(money(forecast_value(Decimal(order_count) * scale, Decimal(previous_order_count))) or Decimal("0")),
+            confidence,
+            "用目前每日訂單速度估算月底及下月訂單量。",
+        ],
+    ]
+
+    current_products = grouped_values(sale_rows, lambda row: (row.category, row.product))
+    previous_products = grouped_values(previous_rows, lambda row: (row.category, row.product))
+    for (category, product), current in sorted(current_products.items(), key=lambda item: item[1]["revenue"], reverse=True)[:8]:
+        previous = previous_products[(category, product)]
+        current_quantity = current["quantity"]
+        current_revenue = current["revenue"]
+        month_end_quantity = current_quantity * scale
+        month_end_revenue = current_revenue * scale
+        next_quantity = forecast_value(month_end_quantity, previous["quantity"])
+        next_revenue = forecast_value(month_end_revenue, previous["revenue"])
+        forecast_rows.append(
+            [
+                "貨品",
+                f"{category} - {product}",
+                f"数量 {float(money(current_quantity) or Decimal('0'))} / HKD {float(money(current_revenue) or Decimal('0')):,.2f}",
+                f"数量 {float(money(month_end_quantity) or Decimal('0'))} / HKD {float(money(month_end_revenue) or Decimal('0')):,.2f}",
+                f"数量 {float(money(next_quantity) or Decimal('0'))} / HKD {float(money(next_revenue) or Decimal('0')):,.2f}",
+                confidence,
+                "貨品預測只列本月收入最高貨品；用於採購及供應參考。",
+            ]
+        )
+
+    if not sale_rows:
+        forecast_rows.append(["提示", "沒有足夠資料", "", "", "", "低", "本月未有有效銷售資料，暫時不能預測。"])
+    return forecast_rows
+
+
 def safe_table_name(title: str) -> str:
     # Excel table names are strict; use ASCII regardless of sheet title.
     suffix = abs(hash(title)) % 1_000_000
@@ -947,6 +1043,12 @@ def write_monthly_report(
     ]
     summary_sheet = add_sheet(workbook, "總覽", ["項目", "數值"], summary)
     add_sheet(workbook, "管理提示", ["嚴重程度", "提示", "內容", "建議行動"], build_monthly_alerts(sale_rows, previous_rows, issues))
+    add_sheet(
+        workbook,
+        "銷售預測",
+        ["類型", "項目", "目前資料", "本月月底預測", "下月預測", "信心", "說明"],
+        build_forecast_rows(month, sale_rows, previous_rows),
+    )
 
     grouped = defaultdict(lambda: {"quantity": Decimal("0"), "revenue": Decimal("0"), "rows": 0, "files": set()})
     for row in sale_rows:
@@ -1197,6 +1299,7 @@ def reorder_monthly_sheets(workbook: Workbook) -> None:
     preferred_order = [
         "總覽",
         "管理提示",
+        "銷售預測",
         "月度比較",
         "客戶分析",
         "貨品分析",

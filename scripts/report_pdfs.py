@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import calendar
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
@@ -197,6 +198,59 @@ def monthly_alerts(rows, previous_rows, issues) -> list[list[str]]:
     return alerts[:8]
 
 
+def confidence_label(elapsed_days: int, order_count: int, previous_rows) -> str:
+    if elapsed_days >= 14 and order_count >= 20 and previous_rows:
+        return "高"
+    if elapsed_days >= 7 and order_count >= 5:
+        return "中"
+    return "低"
+
+
+def forecast_next(current_month_end: Decimal, previous_value: Decimal) -> Decimal:
+    if previous_value <= 0:
+        return current_month_end
+    trend = (current_month_end - previous_value) / previous_value
+    trend = max(Decimal("-0.30"), min(Decimal("0.30"), trend))
+    return current_month_end * (Decimal("1") + trend / Decimal("2"))
+
+
+def monthly_forecast_rows(month: str, rows, previous_rows) -> list[list[str]]:
+    year = int(month[:4])
+    month_number = int(month[4:])
+    days_in_month = calendar.monthrange(year, month_number)[1]
+    dates = [row.order_date for row in rows if row.order_date]
+    elapsed_days = max((day.day for day in dates), default=0)
+    elapsed_days = max(1, min(elapsed_days, days_in_month))
+    scale = Decimal(days_in_month) / Decimal(elapsed_days)
+    order_count = len({row.source_file for row in rows})
+    previous_order_count = len({row.source_file for row in previous_rows})
+    confidence = confidence_label(elapsed_days, order_count, previous_rows)
+
+    total_revenue = sum((row.revenue for row in rows), Decimal("0"))
+    total_quantity = sum((row.quantity for row in rows), Decimal("0"))
+    previous_revenue = sum((row.revenue for row in previous_rows), Decimal("0"))
+    previous_quantity = sum((row.quantity for row in previous_rows), Decimal("0"))
+
+    forecast_revenue = total_revenue * scale
+    forecast_quantity = total_quantity * scale
+    forecast_orders = Decimal(order_count) * scale
+
+    result = [
+        ["總收入", money(total_revenue), money(forecast_revenue), money(forecast_next(forecast_revenue, previous_revenue)), confidence],
+        ["總售出数量", quantity(total_quantity), quantity(forecast_quantity), quantity(forecast_next(forecast_quantity, previous_quantity)), confidence],
+        ["總訂單數量", str(order_count), f"{float(forecast_orders):.1f}", f"{float(forecast_next(forecast_orders, Decimal(previous_order_count))):.1f}", confidence],
+    ]
+
+    products = grouped(rows, lambda row: (row.category, row.product))
+    previous_products = grouped(previous_rows, lambda row: (row.category, row.product))
+    for (category, product), current in sorted(products.items(), key=lambda item: item[1]["revenue"], reverse=True)[:5]:
+        previous = previous_products[(category, product)]
+        month_end_quantity = current["quantity"] * scale
+        next_quantity = forecast_next(month_end_quantity, previous["quantity"])
+        result.append([f"{category}-{product}", quantity(current["quantity"]), quantity(month_end_quantity), quantity(next_quantity), confidence])
+    return result
+
+
 def write_daily_pdf(output: Path, rows, issues) -> None:
     setup_fonts()
     pdf = canvas.Canvas(str(output), pagesize=PAGE)
@@ -358,5 +412,22 @@ def write_monthly_pdf(output: Path, month: str, rows, previous_rows, issues) -> 
     pdf.setFillColor(GRAY)
     pdf.setFont(FONT_NAME, 9)
     pdf.drawString(14 * mm, 10 * mm, "提示只作管理參考，詳細資料以 Excel 月報各分頁為準。")
+    pdf.showPage()
+
+    draw_title(pdf, "銷售預測", month)
+    forecast_table = make_table(
+        "月底及下月預測",
+        ["項目", "目前資料", "本月月底預測", "下月預測", "信心"],
+        monthly_forecast_rows(month, rows, previous_rows),
+        [58 * mm, 42 * mm, 52 * mm, 52 * mm, 24 * mm],
+    )
+    current_y = PAGE[1] - 42 * mm
+    for flowable in forecast_table:
+        _, height = flowable.wrap(PAGE[0] - 28 * mm, PAGE[1])
+        flowable.drawOn(pdf, 14 * mm, current_y - height)
+        current_y -= height + 3 * mm
+    pdf.setFillColor(GRAY)
+    pdf.setFont(FONT_NAME, 9)
+    pdf.drawString(14 * mm, 10 * mm, "預測根據現有訂單速度及上月趨勢估算；新系統初期資料少，請只作管理參考。")
     pdf.showPage()
     pdf.save()

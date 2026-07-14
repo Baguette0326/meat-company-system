@@ -184,6 +184,10 @@ def run() -> None:
         monthly_alert_text = "\n".join(str(row[1]) for row in monthly_alerts_sheet.iter_rows(min_row=2, values_only=True))
         require("收入明顯上升" in monthly_alert_text, "Monthly revenue management alert missing")
         require("本月有訂單調整" in monthly_alert_text, "Monthly adjustment management alert missing")
+        forecast_sheet = load_workbook(monthly_xlsx, data_only=True)["銷售預測"]
+        forecast_labels = [row[1] for row in forecast_sheet.iter_rows(min_row=2, values_only=True)]
+        require("總收入 HKD" in forecast_labels, "Monthly revenue forecast missing")
+        require("總售出数量" in forecast_labels, "Monthly quantity forecast missing")
         monthly_backups = list((root / "Backups").glob("monthly_202606_*/reports/月報表_202606.xlsx"))
         require(monthly_backups, "Monthly report backup missing")
         comparison = load_workbook(monthly_xlsx, data_only=True)["月度比較"]
@@ -192,7 +196,7 @@ def run() -> None:
         )
         require(Decimal(str(revenue_comparison[1])) == Decimal("215"), "Current-month comparison revenue incorrect")
         require(Decimal(str(revenue_comparison[2])) == Decimal("10"), "Previous-month comparison revenue incorrect")
-        require(len(PdfReader(monthly_xlsx.with_suffix(".pdf")).pages) == 3, "Monthly PDF is not three pages")
+        require(len(PdfReader(monthly_xlsx.with_suffix(".pdf")).pages) == 4, "Monthly PDF is not four pages")
 
         dynamic_template = root / "Order Template" / "order-file-template.xlsx"
         dynamic_master = root / "Master Data" / "master-data.xlsx"
